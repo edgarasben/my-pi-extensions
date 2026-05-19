@@ -1,7 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
-import { existsSync, readdirSync, statSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { Buffer } from "node:buffer";
+import { closeSync, existsSync, openSync, readdirSync, readSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 
@@ -12,6 +13,36 @@ type ProjectInfo = {
 	latestFile: string;
 	files: string[];
 };
+
+function readFirstLine(filePath: string, maxBytes = 64 * 1024): string | null {
+	const fd = openSync(filePath, "r");
+	try {
+		const chunks: Buffer[] = [];
+		let totalBytes = 0;
+
+		while (totalBytes < maxBytes) {
+			const bytesToRead = Math.min(8192, maxBytes - totalBytes);
+			const buffer = Buffer.allocUnsafe(bytesToRead);
+			const bytesRead = readSync(fd, buffer, 0, bytesToRead, null);
+			if (bytesRead === 0) break;
+
+			const chunk = buffer.subarray(0, bytesRead);
+			const newlineIndex = chunk.indexOf(10);
+			if (newlineIndex >= 0) {
+				chunks.push(chunk.subarray(0, newlineIndex));
+				return Buffer.concat(chunks).toString("utf8").replace(/\r$/, "");
+			}
+
+			chunks.push(chunk);
+			totalBytes += bytesRead;
+		}
+
+		if (chunks.length === 0) return null;
+		return Buffer.concat(chunks).toString("utf8").replace(/\r$/, "");
+	} finally {
+		closeSync(fd);
+	}
+}
 
 function readProjects(): ProjectInfo[] {
 	const sessionsRoot = process.env.PI_CODING_AGENT_SESSION_DIR ?? join(homedir(), ".pi", "agent", "sessions");
@@ -28,7 +59,9 @@ function readProjects(): ProjectInfo[] {
 
 			const filePath = join(dir, file.name);
 			try {
-				const firstLine = readFileSync(filePath, "utf8").split(/\r?\n/, 1)[0];
+				const firstLine = readFirstLine(filePath);
+				if (!firstLine) continue;
+
 				const cwd = JSON.parse(firstLine)?.cwd;
 				if (typeof cwd !== "string" || cwd.length === 0) continue;
 

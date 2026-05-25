@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder, SessionManager } from "@earendil-works/pi-coding-agent";
-import { Container, Key, matchesKey, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
+import { Container, fuzzyFilter, Input, Key, matchesKey, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
 import { Buffer } from "node:buffer";
 import { closeSync, existsSync, openSync, readdirSync, readSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -14,31 +14,22 @@ type ProjectInfo = {
 	files: string[];
 };
 
-function readFirstLine(filePath: string, maxBytes = 64 * 1024): string | null {
+type ProjectAction = { action: "open" | "resume" | "delete"; cwd: string };
+
+const FIRST_LINE_MAX_BYTES = 64 * 1024;
+const MAX_PROJECT_NAME_WIDTH = 32;
+const MAX_VISIBLE_PROJECTS = 12;
+
+function readFirstLine(filePath: string, maxBytes = FIRST_LINE_MAX_BYTES): string | null {
 	const fd = openSync(filePath, "r");
 	try {
-		const chunks: Buffer[] = [];
-		let totalBytes = 0;
+		const buffer = Buffer.allocUnsafe(maxBytes);
+		const bytesRead = readSync(fd, buffer, 0, maxBytes, null);
+		if (bytesRead === 0) return null;
 
-		while (totalBytes < maxBytes) {
-			const bytesToRead = Math.min(8192, maxBytes - totalBytes);
-			const buffer = Buffer.allocUnsafe(bytesToRead);
-			const bytesRead = readSync(fd, buffer, 0, bytesToRead, null);
-			if (bytesRead === 0) break;
-
-			const chunk = buffer.subarray(0, bytesRead);
-			const newlineIndex = chunk.indexOf(10);
-			if (newlineIndex >= 0) {
-				chunks.push(chunk.subarray(0, newlineIndex));
-				return Buffer.concat(chunks).toString("utf8").replace(/\r$/, "");
-			}
-
-			chunks.push(chunk);
-			totalBytes += bytesRead;
-		}
-
-		if (chunks.length === 0) return null;
-		return Buffer.concat(chunks).toString("utf8").replace(/\r$/, "");
+		const chunk = buffer.subarray(0, bytesRead);
+		const newlineIndex = chunk.indexOf(10);
+		return chunk.subarray(0, newlineIndex >= 0 ? newlineIndex : undefined).toString("utf8").replace(/\r$/, "");
 	} finally {
 		closeSync(fd);
 	}
@@ -86,6 +77,29 @@ function readProjects(): ProjectInfo[] {
 	return [...projects.values()].sort((a, b) => b.latest - a.latest || a.cwd.localeCompare(b.cwd));
 }
 
+function buildProjectItems(projects: ProjectInfo[]): SelectItem[] {
+	const longestName = Math.min(MAX_PROJECT_NAME_WIDTH, Math.max(...projects.map((project) => (basename(project.cwd) || project.cwd).length)));
+
+	return projects.map((project) => {
+		const name = basename(project.cwd) || project.cwd;
+		const label = name.length > longestName ? `${name.slice(0, longestName - 1)}…` : name.padEnd(longestName);
+		return {
+			value: project.cwd,
+			label,
+			description: `${formatRelativeTime(project.latest).padEnd(8)} ${project.cwd}`,
+		};
+	});
+}
+
+function setSelectListItems(selectList: SelectList, items: SelectItem[], filteredItems: SelectItem[]): void {
+	Object.assign(selectList as unknown as { items: SelectItem[]; filteredItems: SelectItem[]; selectedIndex: number; maxVisible: number }, {
+		items,
+		filteredItems,
+		selectedIndex: 0,
+		maxVisible: Math.min(Math.max(items.length, 1), MAX_VISIBLE_PROJECTS),
+	});
+}
+
 function deleteProjectSessions(project: ProjectInfo): number {
 	let deleted = 0;
 	for (const file of project.files) {
@@ -122,50 +136,43 @@ function formatRelativeTime(timestamp: number): string {
 export default function projectsExtension(pi: ExtensionAPI) {
 	pi.registerCommand("projects", {
 		description: "List project paths that have Pi sessions",
-		getArgumentCompletions: (prefix) => {
-			const items = ["all"].map((value) => ({ value, label: value }));
-			const filtered = items.filter((item) => item.value.startsWith(prefix));
-			return filtered.length > 0 ? filtered : null;
-		},
-		handler: async (args, ctx) => {
+		handler: async (_args, ctx) => {
 			const projects = readProjects();
 			if (projects.length === 0) {
 				ctx.ui.notify("No Pi session projects found", "info");
 				return;
 			}
 
-			const mode = args.trim();
-			const visibleProjects = mode === "all" ? projects : projects.slice(0, 50);
-			const projectByValue = new Map<string, ProjectInfo>();
-			const longestName = Math.min(32, Math.max(...visibleProjects.map((project) => (basename(project.cwd) || project.cwd).length)));
-			const items: SelectItem[] = visibleProjects.map((project) => {
-				const name = basename(project.cwd) || project.cwd;
-				const paddedName = name.length > longestName ? name.slice(0, longestName - 1) + "…" : name.padEnd(longestName);
-				projectByValue.set(project.cwd, project);
-				return {
-					value: project.cwd,
-					label: paddedName,
-					description: `${formatRelativeTime(project.latest).padEnd(8)} ${project.cwd}`,
-				};
-			});
+			const items = buildProjectItems(projects);
+			const projectByValue = new Map(projects.map((project) => [project.cwd, project]));
+			let newSessionStatusText = "✓ New session started";
 
-			const suffix = mode === "all" || projects.length <= 50 ? "" : " — latest 50; use /projects all for all";
-			const result = await ctx.ui.custom<{ action: "open" | "delete"; cwd: string } | null>((tui, theme, _kb, done) => {
+			const result = await ctx.ui.custom<ProjectAction | null>((tui, theme, _kb, done) => {
+				newSessionStatusText = theme.fg("accent", "✓ New session started");
 				const container = new Container();
 				container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
-				container.addChild(new Text(theme.fg("accent", theme.bold(`Open new Pi session (${projects.length} projects)${suffix}`)), 1, 0));
+				container.addChild(new Text(theme.fg("accent", theme.bold(`Open new Pi session — ${projects.length} projects`)), 1, 0));
 
-				const selectList = new SelectList(items, Math.min(items.length, 12), {
+				const searchInput = new Input();
+				const selectList = new SelectList([], MAX_VISIBLE_PROJECTS, {
 					selectedPrefix: (t) => theme.fg("accent", t),
 					selectedText: (t) => theme.fg("accent", t),
 					description: (t) => theme.fg("dim", t),
 					scrollInfo: (t) => theme.fg("dim", t),
 					noMatch: (t) => theme.fg("warning", t),
 				});
+				const applyItems = () => {
+					const query = searchInput.getValue().trim();
+					const filteredItems = query ? fuzzyFilter(items, query, (item) => `${item.label} ${item.value} ${item.description ?? ""}`) : items;
+					setSelectListItems(selectList, items, filteredItems);
+				};
+				applyItems();
 				selectList.onSelect = (item) => done({ action: "open", cwd: item.value });
 				selectList.onCancel = () => done(null);
+				container.addChild(new Text(theme.fg("dim", "Search projects:"), 1, 0));
+				container.addChild(searchInput);
 				container.addChild(selectList);
-				container.addChild(new Text(theme.fg("dim", "↑↓ navigate • enter open new session • ctrl+d delete project sessions • esc cancel"), 1, 0));
+				container.addChild(new Text(theme.fg("dim", "Type to search • ↑↓ navigate • enter new session • ctrl+r resume latest • ctrl+d delete • esc cancel"), 1, 0));
 				container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
 
 				return {
@@ -177,7 +184,27 @@ export default function projectsExtension(pi: ExtensionAPI) {
 							if (item) done({ action: "delete", cwd: item.value });
 							return;
 						}
-						selectList.handleInput(data);
+						if (matchesKey(data, Key.ctrl("r"))) {
+							const item = selectList.getSelectedItem?.();
+							if (item) done({ action: "resume", cwd: item.value });
+							return;
+						}
+
+						if (
+							matchesKey(data, Key.up) ||
+							matchesKey(data, Key.down) ||
+							matchesKey(data, Key.enter) ||
+							matchesKey(data, Key.escape) ||
+							matchesKey(data, Key.ctrl("c"))
+						) {
+							selectList.handleInput(data);
+							tui.requestRender();
+							return;
+						}
+
+						const previousSearch = searchInput.getValue();
+						searchInput.handleInput(data);
+						if (previousSearch !== searchInput.getValue()) applyItems();
 						tui.requestRender();
 					},
 				};
@@ -196,6 +223,15 @@ export default function projectsExtension(pi: ExtensionAPI) {
 
 				const deleted = deleteProjectSessions(project);
 				ctx.ui.notify(`Deleted ${deleted} session${deleted === 1 ? "" : "s"} for ${project.cwd}`, "info");
+				return;
+			}
+
+			if (result.action === "resume") {
+				await ctx.switchSession(project.latestFile, {
+					withSession: async (ctx) => {
+						ctx.ui.notify(`Resumed latest session in ${project.cwd}`, "info");
+					},
+				});
 				return;
 			}
 
@@ -234,7 +270,10 @@ export default function projectsExtension(pi: ExtensionAPI) {
 							// If cleanup fails, keep the switched session rather than aborting.
 						}
 					}
-					ctx.ui.notify(`New session opened in ${project.cwd}`, "info");
+
+					// switchSession() always prints "Resumed session" after this callback.
+					// Defer our message so opening a project matches Pi's /new success text/color.
+					setTimeout(() => ctx.ui.notify(newSessionStatusText, "info"), 0);
 				},
 			});
 

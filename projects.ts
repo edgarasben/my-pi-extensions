@@ -35,6 +35,14 @@ function readFirstLine(filePath: string, maxBytes = FIRST_LINE_MAX_BYTES): strin
 	}
 }
 
+function isExistingDirectory(path: string): boolean {
+	try {
+		return existsSync(path) && statSync(path).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
 function readProjects(): ProjectInfo[] {
 	const sessionsRoot = process.env.PI_CODING_AGENT_SESSION_DIR ?? join(homedir(), ".pi", "agent", "sessions");
 	if (!existsSync(sessionsRoot)) return [];
@@ -54,7 +62,7 @@ function readProjects(): ProjectInfo[] {
 				if (!firstLine) continue;
 
 				const cwd = JSON.parse(firstLine)?.cwd;
-				if (typeof cwd !== "string" || cwd.length === 0) continue;
+				if (typeof cwd !== "string" || cwd.length === 0 || !isExistingDirectory(cwd)) continue;
 
 				const mtime = statSync(filePath).mtimeMs;
 				const existing = projects.get(cwd);
@@ -137,17 +145,18 @@ export default function projectsExtension(pi: ExtensionAPI) {
 	pi.registerCommand("projects", {
 		description: "List project paths that have Pi sessions",
 		handler: async (_args, ctx) => {
-			const projects = readProjects();
-			if (projects.length === 0) {
-				ctx.ui.notify("No Pi session projects found", "info");
-				return;
-			}
+			while (true) {
+				const projects = readProjects();
+				if (projects.length === 0) {
+					ctx.ui.notify("No Pi session projects found", "info");
+					return;
+				}
 
-			const items = buildProjectItems(projects);
-			const projectByValue = new Map(projects.map((project) => [project.cwd, project]));
-			let newSessionStatusText = "✓ New session started";
+				const items = buildProjectItems(projects);
+				const projectByValue = new Map(projects.map((project) => [project.cwd, project]));
+				let newSessionStatusText = "✓ New session started";
 
-			const result = await ctx.ui.custom<ProjectAction | null>((tui, theme, _kb, done) => {
+				const result = await ctx.ui.custom<ProjectAction | null>((tui, theme, _kb, done) => {
 				newSessionStatusText = theme.fg("accent", "✓ New session started");
 				const container = new Container();
 				container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
@@ -208,23 +217,28 @@ export default function projectsExtension(pi: ExtensionAPI) {
 						tui.requestRender();
 					},
 				};
-			});
-			if (!result) return;
+				});
+				if (!result) return;
 
-			const project = projectByValue.get(result.cwd);
-			if (!project) return;
+				const project = projectByValue.get(result.cwd);
+				if (!project) continue;
 
-			if (result.action === "delete") {
-				const ok = await ctx.ui.confirm(
-					"Delete project sessions?",
-					`Delete ${project.count} Pi session${project.count === 1 ? "" : "s"} for:\n${project.cwd}\n\nThis removes session history for this project.`,
-				);
-				if (!ok) return;
+				if (result.action === "delete") {
+					const ok = await ctx.ui.confirm(
+						"Delete project sessions?",
+						`Delete ${project.count} Pi session${project.count === 1 ? "" : "s"} for:\n${project.cwd}\n\nThis removes session history for this project.`,
+					);
+					if (!ok) continue;
 
-				const deleted = deleteProjectSessions(project);
-				ctx.ui.notify(`Deleted ${deleted} session${deleted === 1 ? "" : "s"} for ${project.cwd}`, "info");
-				return;
-			}
+					const deleted = deleteProjectSessions(project);
+					ctx.ui.notify(`Deleted ${deleted} session${deleted === 1 ? "" : "s"} for ${project.cwd}`, "info");
+					continue;
+				}
+
+				if (!isExistingDirectory(project.cwd)) {
+					ctx.ui.notify(`Project path no longer exists: ${project.cwd}`, "warning");
+					return;
+				}
 
 			if (result.action === "resume") {
 				await ctx.switchSession(project.latestFile, {
@@ -276,7 +290,8 @@ export default function projectsExtension(pi: ExtensionAPI) {
 					setTimeout(() => ctx.ui.notify(newSessionStatusText, "info"), 0);
 				},
 			});
-
+			return;
+		}
 		},
 	});
 }

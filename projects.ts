@@ -15,6 +15,7 @@ type ProjectInfo = {
 };
 
 type ProjectAction = { action: "open" | "resume" | "delete"; cwd: string };
+type ProjectView = "recent" | "popular";
 
 const FIRST_LINE_MAX_BYTES = 64 * 1024;
 const MAX_PROJECT_NAME_WIDTH = 32;
@@ -85,16 +86,28 @@ function readProjects(): ProjectInfo[] {
 	return [...projects.values()].sort((a, b) => b.latest - a.latest || a.cwd.localeCompare(b.cwd));
 }
 
-function buildProjectItems(projects: ProjectInfo[]): SelectItem[] {
-	const longestName = Math.min(MAX_PROJECT_NAME_WIDTH, Math.max(...projects.map((project) => (basename(project.cwd) || project.cwd).length)));
+function sortProjects(projects: ProjectInfo[], view: ProjectView): ProjectInfo[] {
+	return [...projects].sort((a, b) => {
+		if (view === "popular") return b.count - a.count || b.latest - a.latest || a.cwd.localeCompare(b.cwd);
+		return b.latest - a.latest || a.cwd.localeCompare(b.cwd);
+	});
+}
 
-	return projects.map((project) => {
+function buildProjectItems(projects: ProjectInfo[], view: ProjectView): SelectItem[] {
+	const sortedProjects = sortProjects(projects, view);
+	const longestName = Math.min(MAX_PROJECT_NAME_WIDTH, Math.max(...sortedProjects.map((project) => (basename(project.cwd) || project.cwd).length)));
+
+	return sortedProjects.map((project) => {
 		const name = basename(project.cwd) || project.cwd;
 		const label = name.length > longestName ? `${name.slice(0, longestName - 1)}…` : name.padEnd(longestName);
+		const sessionText = `${project.count} session${project.count === 1 ? "" : "s"}`;
+		const description = view === "popular"
+			? `${sessionText.padEnd(11)} ${formatRelativeTime(project.latest).padEnd(8)} ${project.cwd}`
+			: `${formatRelativeTime(project.latest).padEnd(8)} ${sessionText.padEnd(11)} ${project.cwd}`;
 		return {
 			value: project.cwd,
 			label,
-			description: `${formatRelativeTime(project.latest).padEnd(8)} ${project.cwd}`,
+			description,
 		};
 	});
 }
@@ -152,15 +165,22 @@ export default function projectsExtension(pi: ExtensionAPI) {
 					return;
 				}
 
-				const items = buildProjectItems(projects);
 				const projectByValue = new Map(projects.map((project) => [project.cwd, project]));
 				let newSessionStatusText = "✓ New session started";
 
 				const result = await ctx.ui.custom<ProjectAction | null>((tui, theme, _kb, done) => {
 				newSessionStatusText = theme.fg("accent", "✓ New session started");
+				let view: ProjectView = "recent";
+				let items = buildProjectItems(projects, view);
+				const formatTabs = () => [
+					view === "recent" ? theme.fg("accent", theme.bold("Recent")) : theme.fg("dim", "Recent"),
+					view === "popular" ? theme.fg("accent", theme.bold("Popular")) : theme.fg("dim", "Popular"),
+				].join(theme.fg("dim", " | "));
 				const container = new Container();
 				container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
 				container.addChild(new Text(theme.fg("accent", theme.bold(`Open new Pi session — ${projects.length} projects`)), 1, 0));
+				const tabsText = new Text(formatTabs(), 1, 0);
+				container.addChild(tabsText);
 
 				const searchInput = new Input();
 				const selectList = new SelectList([], MAX_VISIBLE_PROJECTS, {
@@ -175,19 +195,31 @@ export default function projectsExtension(pi: ExtensionAPI) {
 					const filteredItems = query ? fuzzyFilter(items, query, (item) => `${item.label} ${item.value} ${item.description ?? ""}`) : items;
 					setSelectListItems(selectList, items, filteredItems);
 				};
+				const switchView = () => {
+					view = view === "recent" ? "popular" : "recent";
+					items = buildProjectItems(projects, view);
+					tabsText.setText(formatTabs());
+					applyItems();
+				};
 				applyItems();
 				selectList.onSelect = (item) => done({ action: "open", cwd: item.value });
 				selectList.onCancel = () => done(null);
 				container.addChild(new Text(theme.fg("dim", "Search projects:"), 1, 0));
 				container.addChild(searchInput);
 				container.addChild(selectList);
-				container.addChild(new Text(theme.fg("dim", "Type to search • ↑↓ navigate • enter new session • ctrl+r resume latest • ctrl+d delete • esc cancel"), 1, 0));
+				container.addChild(new Text(theme.fg("dim", "tab switch view • type to search • ↑↓ navigate • enter new session • ctrl+r resume latest • ctrl+d delete • esc cancel"), 1, 0));
 				container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
 
 				return {
 					render: (width) => container.render(width),
 					invalidate: () => container.invalidate(),
 					handleInput: (data: string) => {
+						if (matchesKey(data, Key.tab)) {
+							switchView();
+							tui.requestRender();
+							return;
+						}
+
 						if (matchesKey(data, Key.ctrl("d"))) {
 							const item = selectList.getSelectedItem?.();
 							if (item) done({ action: "delete", cwd: item.value });

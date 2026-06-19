@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Container, fuzzyFilter, Input, Key, matchesKey, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
 import { Buffer } from "node:buffer";
-import { closeSync, existsSync, openSync, readdirSync, readSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readdirSync, readSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 
@@ -18,19 +18,41 @@ type ProjectAction = { action: "open" | "resume" | "delete"; cwd: string };
 type ProjectView = "recent" | "popular";
 
 const FIRST_LINE_MAX_BYTES = 64 * 1024;
+const HEADER_CHUNK_BYTES = 8 * 1024;
 const MAX_PROJECT_NAME_WIDTH = 32;
 const MAX_VISIBLE_PROJECTS = 12;
 
-function readFirstLine(filePath: string, maxBytes = FIRST_LINE_MAX_BYTES): string | null {
+// Reused across every file in a single readProjects() pass so we don't allocate
+// a fresh 64 KB buffer per session file.
+const headerBuffer = Buffer.allocUnsafe(FIRST_LINE_MAX_BYTES);
+
+type HeaderInfo = { firstLine: string; mtimeMs: number };
+
+// Reads the first line and mtime from a single open fd: the header is usually a
+// few KB, so we read in chunks and stop as soon as we hit a newline instead of
+// pulling the full 64 KB. Avoids a second path resolution for mtime via fstat.
+function readHeader(filePath: string): HeaderInfo | null {
 	const fd = openSync(filePath, "r");
 	try {
-		const buffer = Buffer.allocUnsafe(maxBytes);
-		const bytesRead = readSync(fd, buffer, 0, maxBytes, null);
-		if (bytesRead === 0) return null;
+		const mtimeMs = fstatSync(fd).mtimeMs;
+		let total = 0;
+		let newlineIndex = -1;
+		while (total < FIRST_LINE_MAX_BYTES) {
+			const want = Math.min(HEADER_CHUNK_BYTES, FIRST_LINE_MAX_BYTES - total);
+			const bytesRead = readSync(fd, headerBuffer, total, want, null);
+			if (bytesRead === 0) break;
+			const found = headerBuffer.indexOf(10, total);
+			total += bytesRead;
+			if (found >= 0 && found < total) {
+				newlineIndex = found;
+				break;
+			}
+		}
+		if (total === 0) return null;
 
-		const chunk = buffer.subarray(0, bytesRead);
-		const newlineIndex = chunk.indexOf(10);
-		return chunk.subarray(0, newlineIndex >= 0 ? newlineIndex : undefined).toString("utf8").replace(/\r$/, "");
+		const end = newlineIndex >= 0 ? newlineIndex : total;
+		const firstLine = headerBuffer.subarray(0, end).toString("utf8").replace(/\r$/, "");
+		return { firstLine, mtimeMs };
 	} finally {
 		closeSync(fd);
 	}
@@ -49,6 +71,9 @@ function readProjects(): ProjectInfo[] {
 	if (!existsSync(sessionsRoot)) return [];
 
 	const projects = new Map<string, ProjectInfo>();
+	// Many session files share the same cwd; cache the directory-existence check
+	// so we stat each unique project path once instead of once per session file.
+	const dirExistsCache = new Map<string, boolean>();
 
 	for (const dirent of readdirSync(sessionsRoot, { withFileTypes: true })) {
 		if (!dirent.isDirectory()) continue;
@@ -59,13 +84,20 @@ function readProjects(): ProjectInfo[] {
 
 			const filePath = join(dir, file.name);
 			try {
-				const firstLine = readFirstLine(filePath);
-				if (!firstLine) continue;
+				const header = readHeader(filePath);
+				if (!header) continue;
 
-				const cwd = JSON.parse(firstLine)?.cwd;
-				if (typeof cwd !== "string" || cwd.length === 0 || !isExistingDirectory(cwd)) continue;
+				const cwd = JSON.parse(header.firstLine)?.cwd;
+				if (typeof cwd !== "string" || cwd.length === 0) continue;
 
-				const mtime = statSync(filePath).mtimeMs;
+				let dirExists = dirExistsCache.get(cwd);
+				if (dirExists === undefined) {
+					dirExists = isExistingDirectory(cwd);
+					dirExistsCache.set(cwd, dirExists);
+				}
+				if (!dirExists) continue;
+
+				const mtime = header.mtimeMs;
 				const existing = projects.get(cwd);
 				if (existing) {
 					existing.count += 1;
